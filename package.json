@@ -1,0 +1,21 @@
+{
+  "name": "comsapo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "言いにくいことを、AIが“伝わる言葉”に変える。2人のすれ違いを整理するAIコミュニケーション支援アプリ (MVP)",
+  "type": "module",
+  "main": "server/index.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node --watch server/index.js",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.131.0",
+    "express": "^5.2.1",
+    "qrcode": "^1.5.4"
+  }
+}
