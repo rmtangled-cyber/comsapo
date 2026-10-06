@@ -4,7 +4,6 @@ import Anthropic from '@anthropic-ai/sdk';
 import { INTERVIEW_SYSTEM, SYNTHESIS_SYSTEM, formatAnswers, formatMemories } from './prompts.js';
 import { COMMON_QUESTIONS } from './questions.js';
 
-const MODEL = process.env.COMSAPO_MODEL || 'claude-opus-5-5';
 const FALLBACK_BETA = 'server-side-fallback-2026-07-01';
 export const MAX_INTERVIEW_TURNS = 6;
 
@@ -74,23 +73,44 @@ const SYNTHESIS_SCHEMA = {
   additionalProperties: false,
 };
 
-export function createAI({ mode } = {}) {
+// USD per million tokens. Used for the spend guard and usage log, not billing.
+const PRICES = {
+  'claude-opus-5-5': { input: 4, output: 20, cacheRead: 0.2 },
+  'claude-sonnet-5-5': { input: 2, output: 10, cacheRead: 0.2 },
+  'claude-haiku-4-5': { input: 1, output: 5, cacheRead: 0.1 },
+};
+
+export function estimateCostUsd(model, usage) {
+  const p = PRICES[model] || PRICES['claude-opus-5-5'];
+  const cost = (usage.input_tokens || 0) * p.input
+    + (usage.cache_creation_input_tokens || 0) * p.input * 1.25
+    + (usage.cache_read_input_tokens || 0) * p.cacheRead
+    + (usage.output_tokens || 0) * p.output;
+  return cost / 1e6;
+}
+
+// `guard()` runs before every call and throws AIError to refuse it (e.g. spend cap);
+// `onUsage()` receives token counts after every call.
+export function createAI({ mode, model = 'claude-opus-5-5', guard = () => {}, onUsage = () => {} } = {}) {
   const hasCreds = Boolean(process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN);
   const resolved = mode || process.env.AI_MODE || (hasCreds ? 'claude' : 'mock');
-  return resolved === 'mock' ? mockAI() : claudeAI(new Anthropic());
+  return resolved === 'mock' ? mockAI({ guard }) : claudeAI(new Anthropic(), { model, guard, onUsage });
 }
 
 // ---------------------------------------------------------------------------
 
-function claudeAI(client) {
-  async function call({ system, messages, schema, effort }) {
+function claudeAI(client, { model, guard, onUsage }) {
+  async function call({ system, messages, schema, effort, kind, talkId }) {
+    guard();
     let res;
     try {
       res = await client.beta.messages.create({
-        model: MODEL,
+        model,
         max_tokens: 16000,
         betas: [FALLBACK_BETA],
         fallbacks: 'default',
+        // Interview turns resend a growing transcript; cache the prefix between turns.
+        cache_control: { type: 'ephemeral' },
         system,
         messages,
         output_config: { effort, format: { type: 'json_schema', schema } },
@@ -100,6 +120,15 @@ function claudeAI(client) {
       if (err instanceof Anthropic.APIError) throw new AIError(`AIの呼び出しに失敗しました (${err.status ?? 'network'})`);
       throw err;
     }
+    const usage = res.usage || {};
+    onUsage({
+      talkId,
+      kind,
+      model: res.model || model,
+      inputTokens: (usage.input_tokens || 0) + (usage.cache_read_input_tokens || 0) + (usage.cache_creation_input_tokens || 0),
+      outputTokens: usage.output_tokens || 0,
+      costUsd: estimateCostUsd(res.model || model, usage),
+    });
     if (res.stop_reason === 'refusal') {
       throw new AIError('この内容はAIが扱えませんでした。表現を変えて、もう一度お試しください。');
     }
@@ -117,12 +146,14 @@ function claudeAI(client) {
 
     // `apiMessages` is the verbatim API transcript (assistant turns keep their
     // thinking blocks) and is only ever appended to, so replayed thinking stays valid.
-    async interview({ apiMessages }) {
+    async interview({ apiMessages, talkId }) {
       const { data, content } = await call({
         system: INTERVIEW_SYSTEM,
         messages: apiMessages,
         schema: INTERVIEW_SCHEMA,
         effort: 'medium',
+        kind: 'interview',
+        talkId,
       });
       return { message: data.message, finished: Boolean(data.finished), assistantContent: content };
     },
@@ -133,6 +164,8 @@ function claudeAI(client) {
         messages: [{ role: 'user', content: synthesisPrompt(input) }],
         schema: SYNTHESIS_SCHEMA,
         effort: 'high',
+        kind: 'synthesis',
+        talkId: input.talkId,
       });
       return data;
     },
@@ -171,7 +204,7 @@ ${blocks.join('\n\n')}
 
 // ---------------------------------------------------------------------------
 
-function mockAI() {
+function mockAI({ guard }) {
   const PROBES = [
     (a) => `話してくれてありがとうございます。「${clip(a.wish || a.hurt)}」とありましたが、具体的にどんな場面でそう感じましたか？`,
     () => 'そのとき、本当はどんな言葉や行動があれば「一緒にやっている」と感じられそうですか？',
@@ -180,6 +213,7 @@ function mockAI() {
   return {
     mode: 'mock',
     async interview({ apiMessages, answers }) {
+      guard();
       const turn = apiMessages.filter((m) => m.role === 'assistant').length;
       if (turn < PROBES.length) return { message: PROBES[turn](answers), finished: false, assistantContent: null };
       return {
@@ -189,6 +223,7 @@ function mockAI() {
       };
     },
     async synthesize({ participants }) {
+      guard();
       const [a, b] = participants;
       const view = (p) => ({
         participant: p.label,

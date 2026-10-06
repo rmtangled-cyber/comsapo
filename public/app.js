@@ -17,11 +17,11 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '
 async function api(method, url, body) {
   const res = await fetch(url, {
     method,
-    headers: body ? { 'Content-Type': 'application/json' } : {},
+    headers: { ...(body ? { 'Content-Type': 'application/json' } : {}), ...(method !== 'GET' ? { 'x-comsapo': '1' } : {}) },
     body: body ? JSON.stringify(body) : undefined,
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw Object.assign(new Error(data.error || '通信に失敗しました'), { status: res.status });
+  if (!res.ok) throw Object.assign(new Error(data.error || '通信に失敗しました'), { status: res.status, data });
   return data;
 }
 
@@ -47,22 +47,29 @@ function busy(button, on, label) {
 
 // --- router ------------------------------------------------------------------
 
+let site = {};
+
 async function router() {
   clearInterval(pollTimer);
-  const hash = location.hash.replace(/^#/, '') || '/';
+  const raw = location.hash.replace(/^#/, '') || '/';
+  const [hash, query] = raw.split('?');
+  const params = new URLSearchParams(query || '');
   const [, section, id] = hash.split('/');
   try {
-    const data = await api('GET', '/api/me');
-    me = data.user;
-    $who.textContent = me ? `${me.name} さん` : '';
-    $banner.innerHTML = data.aiMode === 'mock'
+    site = await api('GET', '/api/me');
+    me = site.user;
+    $who.innerHTML = me?.name ? `<a href="#/account">${esc(me.name)} さん</a>` : '';
+    $banner.innerHTML = site.aiMode === 'mock'
       ? '<div class="banner">デモモード：AIの応答は固定の例です（ANTHROPIC_API_KEY を設定すると Claude が応答します）</div>'
       : '';
+    if (section === 'login') return viewVerify(id, params.get('next'));
+    if (me && !me.name) return viewName(params.get('next') || (section === 'join' ? `#/join/${id}` : ''));
     if (section === 'join') return viewJoin(id);
     if (!me) return viewWelcome();
+    if (section === 'account') return viewAccount(params);
     if (section === 'r') return viewRelationship(id);
     if (section === 't') return viewTalk(id);
-    return viewHome(data.relationships);
+    return viewHome(site.relationships);
   } catch (err) {
     render(`<div class="card"><p class="error">${esc(err.message)}</p><a class="btn secondary" href="#/">ホームへ</a></div>`);
   }
@@ -72,29 +79,83 @@ router();
 
 // --- views -------------------------------------------------------------------
 
-function nameForm({ cta }) {
+function loginForm({ cta, next = '' }) {
   return `
-    <form id="name-form" class="card">
-      <label for="name">あなたの呼び名</label>
-      <input id="name" type="text" maxlength="30" autocomplete="nickname" placeholder="例：はると" required>
-      <p class="muted">相手にもこの名前で表示されます。</p>
+    <form id="login-form" class="card">
+      <label for="email" style="margin-top:0">メールアドレス</label>
+      <input id="email" type="email" inputmode="email" autocomplete="email" placeholder="you@example.com" required>
+      <label class="check"><input type="checkbox" id="agree" required>
+        <span><a href="/legal/terms" target="_blank">利用規約</a>と<a href="/legal/privacy" target="_blank">プライバシーポリシー</a>に同意します（18歳以上の方がご利用いただけます）</span></label>
       <button class="full" type="submit" style="margin-top:12px">${esc(cta)}</button>
+      <p class="muted">パスワードは不要です。届いたメールのリンクからログインできます。</p>
       <p class="error" id="err"></p>
     </form>`;
 }
 
-async function submitName(e) {
-  e.preventDefault();
-  const btn = e.target.querySelector('button');
-  busy(btn, true);
+function bindLoginForm(next = '') {
+  const form = document.getElementById('login-form');
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = form.querySelector('button');
+    busy(btn, true);
+    try {
+      const res = await api('POST', '/api/auth/request', { email: form.email.value, agree: form.agree.checked, next });
+      form.outerHTML = `<div class="card soft"><p><strong>メールを送信しました。</strong></p>
+        <p>${esc(form.email.value)} に届いたリンクを15分以内に開いてください。届かない場合は迷惑メールフォルダもご確認ください。</p>
+        ${res.url ? `<p class="muted">開発用リンク: <a href="${esc(res.url)}">${esc(res.url)}</a></p>` : ''}</div>`;
+    } catch (err) {
+      showError(document.getElementById('err'), err);
+      busy(btn, false);
+    }
+  });
+}
+
+async function viewVerify(token, next) {
+  render('<div class="spinner" role="status" aria-label="ログイン中"></div>');
   try {
-    await api('POST', '/api/users', { name: e.target.name.value });
-    return true;
+    await api('POST', '/api/auth/verify', { token });
+    location.replace(safeNext(next) || '#/');
   } catch (err) {
-    showError(document.getElementById('err'), err);
-    busy(btn, false);
-    return false;
+    render(`<div class="card"><p class="error">${esc(err.message)}</p><a class="btn secondary" href="#/">ログイン画面へ</a></div>`);
   }
+}
+
+const safeNext = (next) => (next && /^#\/[\w/-]*$/.test(next) ? next : '');
+
+function viewName(next) {
+  render(`
+    <h1>はじめまして</h1>
+    <p class="lead">相手に表示される呼び名を教えてください。</p>
+    <form id="name-form" class="card">
+      <label for="name" style="margin-top:0">あなたの呼び名</label>
+      <input id="name" type="text" maxlength="30" autocomplete="nickname" placeholder="例：はると" required>
+      <button class="full" type="submit" style="margin-top:12px">はじめる</button>
+      <p class="error" id="err"></p>
+    </form>`);
+  document.getElementById('name-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = e.target.querySelector('button');
+    busy(btn, true);
+    try {
+      await api('PATCH', '/api/me', { name: e.target.name.value });
+      const target = safeNext(next);
+      if (target && target !== location.hash) location.hash = target;
+      else router();
+    } catch (err) {
+      showError(document.getElementById('err'), err);
+      busy(btn, false);
+    }
+  });
+}
+
+function pricing() {
+  return `
+    <h2>料金</h2>
+    <div class="plans">
+      <div class="card"><h3>Free</h3><p class="price">0円</p><p>2人で月${site.plans.free.talksPerMonth}回まで話し合いができます。</p></div>
+      ${site.billingEnabled ? `<div class="card soft"><h3>Plus</h3><p class="price">${esc(site.priceLabel)}</p>
+        <p>月${site.plans.plus.talksPerMonth}回まで。どちらか1人が加入すれば2人とも使えます。</p></div>` : ''}
+    </div>`;
 }
 
 function viewWelcome() {
@@ -106,10 +167,10 @@ function viewWelcome() {
       <div><strong>2.</strong> AIが個別に話を聞いて、本音を言葉にします</div>
       <div><strong>3.</strong> 2人とも終わったら、AIが気持ち・すれ違い・次の一歩をまとめます</div>
     </div>
-    ${nameForm({ cta: 'はじめる' })}`);
-  document.getElementById('name-form').addEventListener('submit', async (e) => {
-    if (await submitName(e)) router();
-  });
+    ${loginForm({ cta: 'メールでログイン / 登録' })}
+    ${pricing()}
+    <p class="muted">comsapo はカウンセリングや医療の代わりではありません。暴力や身の危険がある場合は、<a href="/legal/support">相談窓口</a>にご相談ください。</p>`);
+  bindLoginForm();
 }
 
 function viewHome(relationships) {
@@ -140,26 +201,74 @@ function viewHome(relationships) {
 
 async function viewJoin(code) {
   const invite = await api('GET', `/api/invites/${encodeURIComponent(code)}`);
-  const accept = async () => {
-    const rel = await api('POST', `/api/invites/${encodeURIComponent(code)}/accept`);
-    location.hash = `#/r/${rel.id}`;
-  };
   render(`
     <h1>${esc(invite.inviterName)} さんから招待が届いています</h1>
     <p class="lead">comsapo は、2人のすれ違いをAIが第三者として整理するアプリです。あなたの回答がそのまま相手に見えることはありません。</p>
-    ${me
-    ? `<button id="accept" class="full">${esc(me.name)} さんとして参加する</button><p class="error" id="err"></p>`
-    : nameForm({ cta: '参加する' })}`);
-  if (me) {
-    document.getElementById('accept').addEventListener('click', (e) => {
-      busy(e.target, true);
-      accept().catch((err) => { showError(document.getElementById('err'), err); busy(e.target, false); });
-    });
-  } else {
-    document.getElementById('name-form').addEventListener('submit', async (e) => {
-      if (await submitName(e)) accept().catch((err) => showError(document.getElementById('err'), err));
-    });
-  }
+    ${invite.full ? '<p class="error">この招待はすでに使われています。</p>'
+    : me ? `<button id="accept" class="full">${esc(me.name)} さんとして参加する</button><p class="error" id="err"></p>`
+      : loginForm({ cta: 'メールで参加する' })}`);
+  if (invite.full) return;
+  if (!me) return bindLoginForm(`#/join/${code}`);
+  document.getElementById('accept').addEventListener('click', async (e) => {
+    busy(e.target, true);
+    try {
+      const rel = await api('POST', `/api/invites/${encodeURIComponent(code)}/accept`);
+      location.hash = `#/r/${rel.id}`;
+    } catch (err) {
+      showError(document.getElementById('err'), err);
+      busy(e.target, false);
+    }
+  });
+}
+
+function viewAccount(params) {
+  const plus = me.plan === 'plus';
+  render(`
+    <a href="#/" class="muted">← ホームへ</a>
+    <h1>アカウント</h1>
+    ${params.get('checkout') === 'success' ? '<div class="card soft"><p>お申し込みありがとうございます。反映まで少し時間がかかることがあります。</p></div>' : ''}
+    <div class="card">
+      <dl class="kv">
+        <dt>呼び名</dt><dd>${esc(me.name)}</dd>
+        <dt>メールアドレス</dt><dd>${esc(me.email)}</dd>
+        <dt>プラン</dt><dd>${plus ? 'Plus' : 'Free'}</dd>
+      </dl>
+      <div class="row" style="margin-top:12px">
+        ${site.billingEnabled && !plus ? '<button id="upgrade">Plus にアップグレード</button>' : ''}
+        ${site.billingEnabled && me.hasBilling ? '<button id="portal" class="secondary">お支払い・解約の管理</button>' : ''}
+      </div>
+      <p class="error" id="err"></p>
+    </div>
+    ${site.billingEnabled && !plus ? pricing() : ''}
+    <h2>データ</h2>
+    <div class="card stack">
+      <a class="btn secondary" href="/api/me/export" download>自分のデータをダウンロード</a>
+      <button id="logout" class="secondary">ログアウト</button>
+      <button id="delete" class="ghost danger">アカウントを削除する</button>
+    </div>`);
+  const $err = document.getElementById('err');
+  const go = (path) => async (e) => {
+    busy(e.target, true, '移動中…');
+    try {
+      location.href = (await api('POST', path)).url;
+    } catch (err) {
+      showError($err, err);
+      busy(e.target, false);
+    }
+  };
+  document.getElementById('upgrade')?.addEventListener('click', go('/api/billing/checkout'));
+  document.getElementById('portal')?.addEventListener('click', go('/api/billing/portal'));
+  document.getElementById('logout').addEventListener('click', async () => {
+    await api('POST', '/api/logout');
+    location.hash = '#/';
+    router();
+  });
+  document.getElementById('delete').addEventListener('click', async () => {
+    if (!confirm('アカウントを削除すると、パートナーとの2人の場所・話し合い・メモもすべて削除され、相手からも見られなくなります。有料プランは解約されます。元に戻せません。削除しますか？')) return;
+    await api('DELETE', '/api/me');
+    location.hash = '#/';
+    router();
+  });
 }
 
 async function viewRelationship(id) {
@@ -203,8 +312,10 @@ async function viewRelationship(id) {
       <button class="ghost" data-forget="${m.id}" aria-label="このメモを削除">削除</button>
     </li>`).join('');
 
+  const q = rel.quota;
   render(`
     <h1>${esc(rel.partner.name)} さんとの2人の場所</h1>
+    <p class="muted">今月の話し合い ${q.used} / ${q.limit} 回（${q.plan === 'plus' ? 'Plus' : 'Free'}）</p>
     <form id="talk-form" class="card">
       <label for="theme" style="margin-top:0">新しい話し合いのテーマ</label>
       <input id="theme" type="text" maxlength="60" placeholder="例：結婚式の準備について" required>
@@ -216,7 +327,13 @@ async function viewRelationship(id) {
     ${talks || '<p class="muted">まだありません。</p>'}
     <h2>2人のメモ（Relationship Memory）</h2>
     <p class="muted">2人とも保存に同意した内容だけが、次回以降の話し合いでAIに参照されます。どちらからでも削除できます。</p>
-    ${memories ? `<ul class="plain card">${memories}</ul>` : '<p class="muted">まだありません。</p>'}`);
+    ${memories ? `<ul class="plain card">${memories}</ul>` : '<p class="muted">まだありません。</p>'}
+    <button id="dissolve" class="ghost danger" style="margin-top:24px">この2人の場所を解消する</button>`);
+  document.getElementById('dissolve').addEventListener('click', async () => {
+    if (!confirm('2人の場所を解消すると、これまでの話し合いとメモがすべて削除され、相手からも見られなくなります。元に戻せません。解消しますか？')) return;
+    await api('DELETE', `/api/relationships/${id}`);
+    location.hash = '#/';
+  });
 
   document.querySelectorAll('[data-theme]').forEach((b) => b.addEventListener('click', () => {
     document.getElementById('theme').value = b.dataset.theme;
@@ -234,7 +351,11 @@ async function viewRelationship(id) {
       const talk = await api('POST', `/api/relationships/${id}/talks`, { theme: e.target.theme.value });
       location.hash = `#/t/${talk.id}`;
     } catch (err) {
-      showError(document.getElementById('err'), err);
+      const $e = document.getElementById('err');
+      showError($e, err);
+      if (err.status === 402 && site.billingEnabled && err.data.quota?.plan === 'free') {
+        $e.insertAdjacentHTML('beforeend', ' <a href="#/account">Plus プランを見る</a>');
+      }
       busy(btn, false);
     }
   });
@@ -376,7 +497,7 @@ function viewWaiting(talk) {
         <span class="badge ${partnerPhase === 'done' ? 'ok' : ''}">${partnerPhase === 'done' ? '回答完了 ✓' : PHASE_LABEL[partnerPhase]}</span></li>
     </ul>
     ${talk.status === 'error' ? `
-      <div class="card"><p class="error">${esc(talk.error)}</p><button id="retry">もう一度整理する</button></div>`
+      <div class="card"><p class="error">${esc(talk.error)}</p>${talk.canRetry ? '<button id="retry">もう一度整理する</button>' : ''}</div>`
     : synthesizing ? `
       <div class="card soft" style="text-align:center">
         <p><strong>2人とも回答が終わりました。</strong></p>
@@ -404,7 +525,7 @@ function viewResult(talk) {
   const tag = (label) => `<span class="who-tag ${label}">${esc(name(label))}</span>`;
   render(`
     ${header(talk, 3)}
-    ${r.safety_note ? `<div class="card safety"><h3>まず大切なこと</h3><p>${esc(r.safety_note)}</p></div>` : ''}
+    ${r.safety_note ? `<div class="card safety"><h3>まず大切なこと</h3><p>${esc(r.safety_note)}</p><p><a href="/legal/support">相談窓口の一覧</a></p></div>` : ''}
     <div class="card soft"><div class="headline">${esc(r.headline)}</div></div>
 
     <h2>それぞれの気持ち</h2>

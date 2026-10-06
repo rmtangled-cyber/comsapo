@@ -1,0 +1,33 @@
+# Fly.io deployment. `fly launch --no-deploy` will offer to rename the app.
+app = "comsapo"
+primary_region = "nrt"
+
+[build]
+
+[env]
+  NODE_ENV = "production"
+  PORT = "8080"
+  DATABASE_FILE = "/data/comsapo.db"
+
+[[mounts]]
+  source = "comsapo_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # SQLite lives on one volume: keep exactly one machine running.
+  auto_stop_machines = "off"
+  auto_start_machines = false
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "30s"
+    method = "GET"
+    path = "/healthz"
+    timeout = "5s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
